@@ -71,6 +71,40 @@ class NodeSetupTests(unittest.TestCase):
                 self.assertIn("original-main:", result.stdout)
                 self.assertIn("kubeadm join private:6443 --token test", result.stdout)
 
+    def test_bundled_installers_bootstrap_both_roles_with_host_operations_stubbed(self):
+        for role in ("master", "worker"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp)
+                (path / f"{role}-startup.sh").write_text('''
+                    source "$BUNDLED_INSTALLER"
+                    setup_system() { :; }
+                    install_crictl() { :; }
+                    install_cni_plugins() { :; }
+                    install_kubernetes_tools() { :; }
+                    is_already_initialized() { return 1; }
+                    init_control_plane() { :; }
+                    setup_kubectl() { :; }
+                    print_join_command() { :; }
+                    is_already_joined() { return 1; }
+                    wait_for_cri() { :; }
+                    kubeadm() { printf 'kubeadm'; printf ' <%s>' "$@"; printf '\\n'; }
+                    apt-get() { return 90; }
+                ''')
+                env = dict(os.environ, BUNDLED_INSTALLER=str(ROOT / f"scripts/{role}-startup.sh"),
+                           LOG_FILE=str(path / "startup.log"), KUBERNETES_VERSION="1.35",
+                           KUBERNETES_PATCH="",
+                           KUBE_JOIN_COMMAND="kubeadm join private:6443 --token test")
+                result = self.shell('''
+                    ubuntu_containerd() { :; }
+                    ubuntu_calico() { :; }
+                    bootstrap "$@"
+                ''', role, tmp, env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"{role.title()} node setup complete!", result.stdout)
+                if role == "worker":
+                    self.assertIn("kubeadm <join> <private:6443> <--token> <test>", result.stdout)
+                    self.assertIn("--token <redacted>", (path / "startup.log").read_text())
+
     def test_bootstrap_restores_readable_apt_files_after_restrictive_transfer_mask(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)

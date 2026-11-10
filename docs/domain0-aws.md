@@ -5,7 +5,11 @@ One-time installation; one clean snapshot pair; restore both roots after each la
 
 Cloud changes incur charges; review the account, region, instance IDs and costs before running them. Snapshot/reset erases lab changes when restored. Use a dedicated, disposable environment—never a shared or production cluster.
 
-**Live test status (2026-11-10):** two Ubuntu 26.04 EC2 nodes were created and passed EC2 status checks. Private EC2 Instance Connect Endpoint `eice-03af049301137e42a` enabled SSH through the AWS CLI tunnel. Reused bootstrap completed: Kubernetes v1.35.10, containerd 2.2.2, Calico VXLAN, two Ready nodes, CoreDNS, cross-node DNS/HTTP, NetworkPolicy deny/re-allow, cgroup2 and AppArmor. Both masked roots were snapshotted; both roots were restored from those snapshots. Namespace and node-file rollback markers disappeared; both nodes returned Ready and CoreDNS rolled out. Nodes are stopped; temporary terminal-IP ingress removed. Endpoint, baseline snapshots, displaced roots and dedicated security groups remain. Offline regression suite: 18 checks pass. Offline CKS tools (`etcdctl`, `kube-bench`, `trivy` DB, `cosign`, `kubesec`, `kube-linter`, `helm` charts, `yq`, `jq`) were not installed or accepted.
+**Live test status (2026-11-10):** two Ubuntu 26.04 EC2 nodes were created and passed EC2 status checks. Private EC2 Instance Connect Endpoint `eice-03af049301137e42a` enabled SSH through the AWS CLI tunnel. Reused bootstrap completed: Kubernetes v1.35.10, containerd 2.2.2, Calico VXLAN, two Ready nodes, CoreDNS, cross-node DNS/HTTP, NetworkPolicy deny/re-allow, cgroup2 and AppArmor. Both masked roots were snapshotted; both roots were restored from those snapshots. Namespace and node-file rollback markers disappeared; both nodes returned Ready and CoreDNS rolled out. Nodes are stopped; temporary terminal-IP ingress removed. Endpoint, baseline snapshots, displaced roots and dedicated security groups remain. Offline regression suite: 19 checks pass, including both bundled installers with host operations stubbed; the fresh-install retest is recorded below. Offline CKS tools (`etcdctl`, `kube-bench`, `trivy` DB, `cosign`, `kubesec`, `kube-linter`, `helm` charts, `yq`, `jq`) were not installed or accepted.
+
+**Bundled-script live retest (2026-11-10, `ap-southeast-1`):** a separate fresh pair of Ubuntu 26.04 `t3.medium` nodes completed bootstrap using this project's three scripts, with transferred SHA-256 hashes matching local files. Kubernetes v1.35.10, containerd 2.2.2, two Ready nodes, CoreDNS, Calico v3.33.0 VXLAN, cross-node DNS/HTTP and NetworkPolicy deny/re-allow passed. The temporary test namespace was removed. Initial verification attempts encountered EC2 Instance Connect's five-second `AuthorizedKeysCommand` timeout, a CRI startup timeout and transient API authorization failure; persistent SSH sessions and API-readiness checks allowed network verification to finish. A subsequent host-check driver error (`crictl --timeout 60` instead of `60s`) was corrected; final checks passed on both hosts: active containerd/kubelet, working CRI, cgroup2 and AppArmor. Both temporary instances are stopped. The original lab was untouched. No snapshots or restore drill were run on the fresh pair; retained test roots continue incurring EBS charges.
+
+**Cleanup status (2026-11-10, `ap-southeast-1`):** all four lab instances were terminated; all four lab snapshots and all six EBS volumes (four attached roots plus two detached roots) were deleted. No owned snapshots or EBS volumes remained in this region after verification. The Instance Connect endpoint, security groups, VPC and subnet were retained. Test results above are historical; no running/stopped lab or recoverable baseline remains.
 
 ## 1. Local preflight (read-only)
 
@@ -98,9 +102,9 @@ WORKER=$("$AWS" ec2 run-instances --region "$AWS_REGION" --image-id "$AMI" \
 
 If a launch response is lost, inspect instances by the `Purpose=cks-domain0` tag before retrying. Do not blindly launch duplicates. Save `$MASTER`, `$WORKER`, `$SG`, `$SUBNET_ID`, and region **outside Git**. Public IPv4 can change after ordinary stop/start; private IP and node hostname persist. Use console instance IDs, not bookmarked public IPs.
 
-## 3. Install once using the existing scripts
+## 3. Install once using the bundled scripts
 
-The existing scripts target Ubuntu 22.04 and require Docker-repository containerd 1.7. Ubuntu 26.04's repository does not provide that series. `scripts/node-setup.sh` sources the originals, overrides runtime installation with Ubuntu's **containerd 2.x**, enables **systemd cgroups**, and installs **Calico v3.33.0 with VXLAN**. Other bootstrap functions remain unchanged; original defaults use Kubernetes **1.35**. This combination still needs a real EC2 smoke test; offline tests do not establish distro compatibility.
+`scripts/master-startup.sh` and `scripts/worker-startup.sh` are unchanged copies of the cka-packs installers; no external checkout is required. They target Ubuntu 22.04 and require Docker-repository containerd 1.7. Ubuntu 26.04's repository does not provide that series. `scripts/node-setup.sh` sources these bundled scripts, overrides runtime installation with Ubuntu's **containerd 2.x**, enables **systemd cgroups**, and installs **Calico v3.33.0 with VXLAN**. Other bootstrap functions remain unchanged; original defaults use Kubernetes **1.35**. The previous EC2 smoke test is recorded above; offline checks do not establish fresh-install compatibility.
 
 On each console, first wait for cloud-init and confirm hostname:
 
@@ -109,11 +113,10 @@ sudo cloud-init status --wait
 hostname
 ```
 
-Use reviewed local copies of `master-startup.sh`, `worker-startup.sh`, and `node-setup.sh`. No `git clone` with access tokens, no `cka-sim bootstrap`. To transfer without SSH setup, the following **local** command prints pasteable base64 commands. Review the source files first, then paste the output into each node's console. It creates `/home/ubuntu/setup-lab` and writes these three files there.
+Use the reviewed copies of `master-startup.sh`, `worker-startup.sh`, and `node-setup.sh` in this project's `scripts/` directory. No `git clone` with access tokens, no `cka-sim bootstrap`. To transfer without SSH setup, the following **local** command prints pasteable base64 commands. Run from this worktree's root. Review the source files first, then paste the output into each node's console. It creates `/home/ubuntu/setup-lab` and writes these three files there.
 
 ```bash
-SOURCE=/home/thienpv/projects/external/gitlab-com/cka-packs/cka-sim/scripts/setup
-python3 -I - "$SOURCE" scripts/node-setup.sh <<'PY'
+python3 -I - scripts scripts/node-setup.sh <<'PY'
 import base64, pathlib, sys
 files = [pathlib.Path(sys.argv[1]) / name for name in ("master-startup.sh", "worker-startup.sh")]
 files.append(pathlib.Path(sys.argv[2]))
@@ -318,7 +321,7 @@ kubectl -n kube-system rollout status deployment/coredns --timeout=180s
 
 ```bash
 python3 -I tests/check_domain0.py
-bash -n scripts/node-setup.sh
+for script in scripts/*-startup.sh scripts/node-setup.sh; do bash -n "$script" || exit; done
 git diff --check
 ```
 
