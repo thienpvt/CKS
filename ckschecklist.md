@@ -43,6 +43,8 @@ Trọng số lấy từ CNCF curriculum hiện hành. **System Hardening là dom
 
 ## 🧰 Domain 0 — Setup môi trường (gate, không phải "ngày")
 
+**Lab AWS:** [Ubuntu 26.04, 1 control-plane + 1 worker; setup một lần, snapshot baseline, reset sau mỗi bài](docs/domain0-aws.md). Kết nối qua AWS Console; không dùng `cka-sim bootstrap`.
+
 **Khác gì CKA/CKAD:** CKS sửa **file trên node** (kubelet config, static pod manifest, audit policy, EncryptionConfiguration, Falco rules), không chỉ `kubectl apply`. Vòng `$do + sửa + apply` chỉ là phụ. Cần track riêng "node/file objectives".
 
 - [ ] **Bài 0.1 — Lab đủ mạnh:** kubeadm VM 1 control-plane + 1 worker có snapshot (kind **không** đủ cho node-level: node là container, kube-bench cho kết quả sai cấu trúc, AppArmor/seccomp Localhost cần mount host). Không có VM → dùng Killercoda CKS cho phần cluster-level, ghi rõ phần nào **Blocked**.
