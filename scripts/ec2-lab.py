@@ -92,16 +92,44 @@ def verify_snapshots(data, wait=False):
         time.sleep(15)
 
 
-def confirm(ids, snapshot=False):
+def confirm(ids, snapshot=False, cleanup=False):
     if snapshot:
-        print("Confirm BOTH nodes have kubelet and containerd persistently MASKED and STOPPED, "
-              "then were stopped in EC2. AWS cannot verify guest service state.")
+        print("Confirm control-plane NoSchedule taint was removed, and BOTH nodes have kubelet "
+              "and containerd persistently MASKED and STOPPED, then were stopped in EC2. "
+              "AWS cannot verify guest state.")
+    elif cleanup:
+        print("WARNING: Termination permanently removes BOTH lab instances. "
+              "Retained snapshots, detached displaced volumes, endpoint and security groups "
+              "are separate resources.")
     else:
         print("WARNING: Reset discards ALL changes on BOTH root disks since baseline. "
               "Keep node services masked until BOTH replacement tasks succeed. Old disks retained.")
     expected = " ".join(ids)
     if input(f"Type both instance IDs to confirm [{expected}]: ").strip() != expected:
         raise RuntimeError("Confirmation did not match; no mutations requested")
+
+
+def cleanup_nodes(ids, apply):
+    response = aws("ec2", "describe-instances", "--instance-ids", *ids)
+    instances = {i["InstanceId"]: i for r in response["Reservations"] for i in r["Instances"]}
+    if set(instances) != set(ids):
+        raise RuntimeError("Expected exactly the two requested lab instances")
+    for ident in ids:
+        purpose = {tag["Key"]: tag["Value"] for tag in instances[ident].get("Tags", [])}.get("Purpose")
+        if purpose != "cks-domain0":
+            raise RuntimeError(f"{ident}: Purpose tag is not cks-domain0; refusing termination")
+    active = [ident for ident in ids if instances[ident]["State"]["Name"] != "terminated"]
+    print("PLAN terminate-instances --instance-ids " + " ".join(active or ids))
+    if not apply:
+        print("Read-only preview. Add --apply to confirm permanent lab termination.")
+        return
+    if not active:
+        print("Both lab instances are already terminated.")
+        return
+    confirm(ids, cleanup=True)
+    aws("ec2", "terminate-instances", "--instance-ids", *active)
+    aws("ec2", "wait", "instance-terminated", "--instance-ids", *active)
+    print("Both lab instances terminated. Snapshots, detached volumes, endpoint and security groups remain.")
 
 
 def wait_tasks(path, journal):
@@ -136,27 +164,38 @@ def wait_tasks(path, journal):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("snapshot", "reset"))
-    for flag in ("master", "worker", "region", "baseline"):
+    parser.add_argument("action", choices=("snapshot", "reset", "cleanup"))
+    for flag in ("master", "worker", "region"):
         parser.add_argument(f"--{flag}", required=True)
+    parser.add_argument("--baseline", required=False)
     parser.add_argument("--apply", action="store_true", help="request cloud mutations; prompts for confirmation")
+    parser.add_argument("--taint-free", action="store_true",
+                        help="require the control-plane NoSchedule taint to be removed before snapshot")
     args = parser.parse_args(argv)
     ids = [args.master, args.worker]
     if len(set(ids)) != 2 or not all(re.fullmatch(r"i-[0-9a-f]{8,17}", i) for i in ids):
         raise ValueError("Two distinct valid instance IDs required")
     global REGION
     REGION = args.region
-    path = Path(args.baseline).expanduser().absolute()
+    if args.action != "cleanup" and not args.baseline:
+        parser.error("--baseline is required for snapshot/reset")
+    path = Path(args.baseline).expanduser().absolute() if args.baseline else None
     account = aws("sts", "get-caller-identity")["Account"]
     print(f"Account {account}; region {REGION}; nodes {' '.join(ids)}")
+    if args.action == "cleanup":
+        cleanup_nodes(ids, args.apply)
+        return
     nodes = nodes_for(ids, "stopped" if args.action == "snapshot" else "running")
 
     if args.action == "snapshot":
+        if args.apply and not args.taint_free:
+            raise RuntimeError("Confirm a taint-free control-plane before snapshot using --taint-free")
         if path.exists():
             raise RuntimeError("Baseline file exists; never overwrite it. Inspect previous operation first.")
         if not path.parent.is_dir():
             raise RuntimeError("Create the baseline's parent directory outside the repository first")
         data = {"account": account, "region": REGION, "services_masked": True,
+                "control_plane_schedulable": True,
                 "created_at": datetime.now(timezone.utc).isoformat(), "nodes": nodes}
         for node in nodes:
             print(f"PLAN create-snapshot --volume-id {node['root_volume_id']} ({node['role']})")
@@ -180,10 +219,11 @@ def main(argv=None):
     data = json.loads(path.read_text())
     if (data.get("account") != account or data.get("region") != REGION or
             data.get("services_masked") is not True or
+            data.get("control_plane_schedulable") is not True or
             [(n.get("role"), n.get("instance_id")) for n in data.get("nodes", [])] !=
             [("master", ids[0]), ("worker", ids[1])] or
             not all(n.get("snapshot_id") for n in data["nodes"])):
-        raise RuntimeError("Account, region, node identities, masking or snapshots do not match baseline")
+        raise RuntimeError("Account, region, node identities, masking, schedulable control-plane or snapshots do not match baseline")
     verify_snapshots(data)
     active = aws("ec2", "describe-replace-root-volume-tasks", "--filters",
                  f"Name=instance-id,Values={','.join(ids)}")["ReplaceRootVolumeTasks"]
@@ -213,7 +253,8 @@ def main(argv=None):
         node["task_id"] = task["ReplaceRootVolumeTask"]["ReplaceRootVolumeTaskId"]
         save(journal_path, journal)
     wait_tasks(journal_path, journal)
-    print("Both roots restored. Reconnect consoles; unmask/start services on BOTH nodes, then verify cluster.")
+    aws("ec2", "wait", "instance-status-ok", "--instance-ids", *ids)
+    print("Both roots restored. Reconnect SSH tunnels; unmask/start services on BOTH nodes, then verify cluster.")
     print("Retained displaced disks (delete explicitly ONLY after verification): " +
           " ".join(n["displaced_volume_id"] for n in journal["nodes"]))
     print(f"Journal: {journal_path}. AWS task success is not a Kubernetes health check.")

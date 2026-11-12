@@ -43,7 +43,7 @@ Trọng số lấy từ CNCF curriculum hiện hành. **System Hardening là dom
 
 ## 🧰 Domain 0 — Setup môi trường (gate, không phải "ngày")
 
-**Lab AWS:** [Ubuntu 26.04, 1 control-plane + 1 worker; setup một lần, snapshot baseline, reset sau mỗi bài](docs/domain0-aws.md). Kết nối qua AWS Console; không dùng `cka-sim bootstrap`.
+**Lab AWS:** [Ubuntu 26.04, 1 control-plane + 1 worker; setup một lần, snapshot baseline, reset sau mỗi bài](docs/domain0-aws.md). Kết nối terminal qua AWS CLI + SSH/private EC2 Instance Connect Endpoint; không dùng `cka-sim bootstrap`.
 
 **Khác gì CKA/CKAD:** CKS sửa **file trên node** (kubelet config, static pod manifest, audit policy, EncryptionConfiguration, Falco rules), không chỉ `kubectl apply`. Vòng `$do + sửa + apply` chỉ là phụ. Cần track riêng "node/file objectives".
 
@@ -81,11 +81,25 @@ crictl logs <container-id> | tail -20
   k exec frontend -- nslookup kubernetes.default
   ```
   Nhớ: nhiều rule = **OR**, nhiều điều kiện trong 1 rule = **AND**; thiếu egress DNS thì mọi resolve tên hỏng. `namespaceSelector` dùng label `kubernetes.io/metadata.name`, không dùng tên namespace.
-- [ ] **Bài 1.2 — Ingress TLS:** `k create secret tls web-tls --cert=tls.crt --key=tls.key`; Ingress host `web.local` path `/` → svc, thêm `/api` → svc khác. Kiểm:
-  ```bash
-  k run tmp --rm -it --image=busybox --restart=Never -- \
-    wget -qO- --no-check-certificate --header='Host: web.local' https://<ingress-ip>/
-  ```
+- [ ] **Bài 1.2 — Ingress TLS (ép HTTPS + routing theo path):**
+  1. Tạo chứng chỉ tự ký và lưu vào Secret kiểu `tls`:
+     ```bash
+     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+       -keyout tls.key -out tls.crt -subj "/CN=web.local"
+     k -n prod create secret tls web-tls --cert=tls.crt --key=tls.key
+     ```
+  2. Tạo `Ingress` gắn `spec.tls` (`web-tls`), bật redirect HTTP → HTTPS, định tuyến `/` → `web-svc:80` và `/api` → `api-svc:80`:
+     ```bash
+     k -n prod create ingress web --class=nginx \
+       --rule="web.local/=web-svc:80,tls=web-tls" \
+       --rule="web.local/api=api-svc:80" \
+       --annotation nginx.ingress.kubernetes.io/ssl-redirect="true"
+     ```
+  3. Kiểm chứng TLS và redirect qua IP của Ingress controller:
+     ```bash
+     curl -vk --resolve web.local:443:<ingress-ip> https://web.local/
+     curl -I  --resolve web.local:80:<ingress-ip>  http://web.local/   # trả 308/301 sang HTTPS
+     ```
 - [ ] **Bài 1.3 — CIS benchmark + remediation loop:** đọc manifest trước khi apply, pin version (fetch-and-run YAML chạy với quyền cluster). Chạy kube-bench trên control-plane node:
   ```bash
   k apply -f kube-bench-job.yaml
@@ -97,9 +111,51 @@ crictl logs <container-id> | tail -20
   curl -k https://<apiserver>:6443/api/v1/namespaces/default/pods   # 401/403, không trả list
   ```
 - [ ] **Bài 1.5 — Kubelet hardening:** `/var/lib/kubelet/config.yaml` đặt `authentication.anonymous.enabled: false`, `authorization.mode: Webhook`, `readOnlyPort: 0`; `systemctl daemon-reload && systemctl restart kubelet`; `curl -k https://<node>:10250/pods` → 401/403.
-- [ ] **Bài 1.6 — Verify platform binary:** tải `kube-apiserver` + `kube-apiserver.sha512` cùng bản release; `sha512sum kube-apiserver` khớp trước khi tin binary.
-- [ ] **Bài 1.7 — Metadata endpoint (chỉ trên cloud node):** netpol egress default-deny, không allow `169.254.169.254/32`; `k exec p -- wget -T2 -qO- http://169.254.169.254/` → timeout. Trên kind/kubeadm endpoint không tồn tại → timeout **không** chứng minh gì; đánh dấu cloud-only, không dùng làm gate local.
-- [ ] **Bài 1.8 — Dashboard/GUI exposure:** tìm service type `LoadBalancer`/`NodePort` phơi ra ngoài, thu hồi `cluster-admin` của dashboard SA, gán Role chỉ `get/list`; `k auth can-i --list --as=system:serviceaccount:kubernetes-dashboard:kubernetes-dashboard`.
+- [ ] **Bài 1.6 — Verify platform binary (đối chiếu mã băm SHA-512 trên node):**
+  Trên kubeadm, `kubelet`/`kubectl`/`kubeadm` nằm tại `/usr/bin/` (còn `kube-apiserver` chạy bằng static pod hoặc đề cung cấp sẵn thư mục chứa các file binary cần kiểm tra).
+  1. Kiểm tra version và vị trí file binary:
+     ```bash
+     kubelet --version                  # ví dụ: Kubernetes v1.35.10
+     which kubelet kubectl kubeadm
+     ```
+  2. Lấy mã băm `.sha512` chính thức cùng version (hoặc từ đề bài) và đối chiếu trực tiếp:
+     ```bash
+     VER=v1.35.10
+     curl -fsSLO "https://dl.k8s.io/release/${VER}/bin/linux/amd64/kubelet.sha512"
+     sha512sum /usr/bin/kubelet
+     echo "$(cat kubelet.sha512)  /usr/bin/kubelet" | sha512sum -c -   # phải trả về: OK
+     ```
+  3. Nếu lệch hash (`FAILED`): binary đã bị can thiệp — xoá hoặc chép đè bằng binary sạch theo yêu cầu đề.
+- [ ] **Bài 1.7 — Chặn IP/metadata nhạy cảm bằng `ipBlock` + giữ egress CoreDNS (kịch bản kubeadm):**
+  *Lưu ý phân biệt:* quên mở egress tới CoreDNS là lỗi làm đứt DNS ở **Bài 1.1 / Drill phá hoại**. Còn **Bài 1.7** kiểm tra kỹ năng dùng `ipBlock.except` để chặn pod gọi vào IP nhạy cảm (IMDS `169.254.169.254/32` trên EC2 hoặc IP giả lập trên node kubeadm) **mà vẫn giữ nguyên DNS tới CoreDNS**:
+  1. Trên kubeadm (nếu không có sẵn cloud metadata), gắn IP giả lập trên node để test thật:
+     ```bash
+     sudo ip addr add 169.254.169.254/32 dev lo
+     python3 -m http.server 80 --bind 169.254.169.254 &
+     ```
+  2. Áp `NetworkPolicy` có `policyTypes: ["Egress"]` gồm **2 rule**:
+     - Rule 1 (mở DNS tới CoreDNS): allow port `53` `UDP`/`TCP` tới `namespaceSelector: {kubernetes.io/metadata.name: kube-system}`.
+     - Rule 2 (chặn IP nhạy cảm): allow `to: [{ipBlock: {cidr: 0.0.0.0/0, except: ["169.254.169.254/32"]}}]`.
+  3. Kiểm chứng từ trong pod (DNS vẫn chạy, nhưng IP nhạy cảm bị chặn):
+     ```bash
+     k -n prod exec frontend -- nslookup kubernetes.default           # PASS (CoreDNS thông)
+     k -n prod exec frontend -- wget -T2 -qO- http://169.254.169.254/ # TIMEOUT ≤2s (bị except chặn)
+     ```
+- [ ] **Bài 1.8 — Siết Kubernetes Dashboard / Web GUI bị phơi bày:**
+  Khi đề cho sẵn một Dashboard/GUI cấu hình lỏng lẻo, kiểm tra và khóa đủ **3 điểm**:
+  1. **Thu hẹp Service exposure:** đổi `type: NodePort` hoặc `LoadBalancer` về `ClusterIP` để không phơi trực tiếp ra ngoài node:
+     ```bash
+     k -n kubernetes-dashboard patch svc kubernetes-dashboard -p '{"spec":{"type":"ClusterIP"}}'
+     ```
+  2. **Xoá cờ insecure trên Deployment:** `k -n kubernetes-dashboard edit deploy kubernetes-dashboard` → bỏ `--enable-skip-login`, `--enable-insecure-login`, `--insecure-bind-address=0.0.0.0`; giữ `--auto-generate-certificates`.
+  3. **Hạ quyền RBAC của ServiceAccount:** xoá `ClusterRoleBinding` gán `cluster-admin`, chỉ cấp `Role` tối thiểu (`get,list` trong namespace):
+     ```bash
+     k delete clusterrolebinding kubernetes-dashboard-admin
+     k -n kubernetes-dashboard create role dash-ro --verb=get,list --resource=pods,services
+     k -n kubernetes-dashboard create rolebinding dash-ro --role=dash-ro \
+       --serviceaccount=kubernetes-dashboard:kubernetes-dashboard
+     k auth can-i create deployments --as=system:serviceaccount:kubernetes-dashboard:kubernetes-dashboard   # no
+     ```
 - [ ] **Bài 1.9 — EndpointSlice thay Endpoints:** `k get endpoints` deprecated từ v1.33; kiểm service wiring bằng `k get endpointslice -l kubernetes.io/service-name=<svc>`.
 
 **Drill phá hoại (failure injection):** xoá rule egress DNS khỏi netpol của bài 1.1 → mọi `nslookup` timeout, app không gọi được service. Đo thời gian phát hiện (`k describe netpol`, `k exec -- nslookup`), rồi thêm lại rule, verify. Mục tiêu ≤5 phút từ lúc thấy triệu chứng đến lúc sửa xong.
@@ -108,7 +164,7 @@ crictl logs <container-id> | tail -20
 - `k get netpol -n prod -o yaml` + cặp kết quả timeout/open từ trong pod (cross-node nếu được)
 - kube-bench summary: PASS/FAIL trước và sau khi sửa
 - `sha512sum` khớp file `.sha512`
-- `curl` apiserver/kubelet trả 401/403; metadata timeout ≤2s (cloud)
+- `curl` apiserver/kubelet trả 401/403; `nslookup` thông nhưng `169.254.169.254` timeout ≤2s (`ipBlock.except`)
 
 **Gate:**
 - [ ] ≤12 phút, từ namespace trống: dựng default-deny + 2 allow (ingress từ frontend, egress DNS)
@@ -135,10 +191,61 @@ crictl logs <container-id> | tail -20
   ```
 - [ ] **Bài 2.2 — Tắt automount:** `k patch sa default -p '{"automountServiceAccountToken":false}'`; tạo pod mới; `k exec ... -- ls /var/run/secrets/kubernetes.io/serviceaccount` → No such file.
 - [ ] **Bài 2.3 — Token ngắn hạn + audience:** `k create token build-bot --duration=10m --audience=https://kubernetes.default.svc`; decode payload `cut -d. -f2 | base64 -d`, xác nhận `exp` ~10 phút và `aud` đúng.
-- [ ] **Bài 2.4 — Leo thang quyền:** thử tạo Role có verb `escalate`, rolebinding tới `cluster-admin`, hoặc impersonate user khác bằng SA thường → phải bị từ chối. Ghi lại message `forbidden`.
-- [ ] **Bài 2.5 — Siết API access:** `--anonymous-auth=false` + `--authorization-mode=Node,RBAC` + `--enable-admission-plugins=NodeRestriction`. Hiểu vì sao NodeRestriction chặn kubelet sửa pod của node khác.
-- [ ] **Bài 2.6 — RBAC wildcard audit:** `k auth can-i --list --as=system:serviceaccount:demo:build-bot`; tìm rule `*`/`*`; thu hẹp. Kiểm tra cả `bind`/`escalate` trên roles/clusterroles.
-- [ ] **Bài 2.7 — Aggregated ClusterRole:** tạo ClusterRole có `aggregationRule` gom label, verify quyền hợp nhất bằng `auth can-i`.
+- [ ] **Bài 2.4 — Chặn leo thang quyền (RBAC privilege escalation & impersonation):**
+  Kubernetes chỉ cho phép một user/SA tạo hoặc sửa `Role`/`RoleBinding` nếu bản thân nó **đã có sẵn** mọi quyền trong Role đó (trừ khi có verb `escalate` hoặc `bind`).
+  1. Cấp cho SA `demo:build-bot` quyền tạo `roles,rolebindings` trong namespace `demo` (nhưng **không** cấp quyền đọc `secrets`):
+     ```bash
+     k -n demo create role role-creator --verb=create,get,list --resource=roles,rolebindings
+     k -n demo create rolebinding role-creator --role=role-creator --serviceaccount=demo:build-bot
+     ```
+  2. Dùng SA `build-bot` thử tự tạo Role đọc `secrets` hoặc tự gán `cluster-admin` → phải bị API server chặn:
+     ```bash
+     k -n demo create role steal-sec --verb=get --resource=secrets \
+       --as=system:serviceaccount:demo:build-bot
+     # Forbidden: user ... is attempting to grant RBAC permissions not currently held
+     ```
+  3. Thử mạo danh (`impersonate`) admin bằng SA thường → bị chặn:
+     ```bash
+     k get secrets -n demo --as=system:admin --as=system:serviceaccount:demo:build-bot # Forbidden
+     ```
+- [ ] **Bài 2.5 — Siết API access & NodeRestriction:**
+  Trên `/etc/kubernetes/manifests/kube-apiserver.yaml`, kiểm tra đủ 3 cờ:
+  - `--anonymous-auth=false`
+  - `--authorization-mode=Node,RBAC`
+  - `--enable-admission-plugins=NodeRestriction`
+  *Ý nghĩa trên kubeadm:* `Node` authorizer + `NodeRestriction` admission chỉ cho kubelet trên một node (`system:node:cks-worker`) sửa `Node`/`Pod` status thuộc về chính node đó, và chặn kubelet tự gắn label nhạy cảm (`node-role.kubernetes.io/*`).
+- [ ] **Bài 2.6 — Rà soát và thu hẹp RBAC wildcard (`*`) / verb nguy hiểm:**
+  1. Tìm các `Role`/`ClusterRole` trong namespace đang mở `*` hoặc có `bind`/`escalate`/`impersonate`:
+     ```bash
+     k -n demo get role -o json | jq -r '.items[] | select(.rules[]? | (.verbs[]? == "*" or .resources[]? == "*" or (.verbs[]? | IN("bind","escalate","impersonate")))) | .metadata.name'
+     ```
+  2. Xem các pod dùng SA đó thực sự gọi API nào (qua `k logs <pod>` hoặc đề bài), rồi sửa `Role` chỉ giữ đúng `apiGroups`, `resources` và `verbs` tối thiểu (`get`, `list`, `watch`).
+  3. Kiểm tra lại toàn bộ quyền của SA:
+     ```bash
+     k auth can-i --list -n demo --as=system:serviceaccount:demo:build-bot
+     ```
+- [ ] **Bài 2.7 — Aggregated ClusterRole (gom quyền tự động theo label):**
+  1. Tạo ClusterRole cha có `aggregationRule` (không viết `rules` tay — controller sẽ tự gộp):
+     ```yaml
+     apiVersion: rbac.authorization.k8s.io/v1
+     kind: ClusterRole
+     metadata:
+       name: monitoring-umbrella
+     aggregationRule:
+       clusterRoleSelectors:
+       - matchLabels:
+           rbac.example.com/aggregate-to-monitoring: "true"
+     rules: []
+     ```
+  2. Tạo ClusterRole con gắn label `rbac.example.com/aggregate-to-monitoring: "true"`:
+     ```bash
+     k create clusterrole pod-reader --verb=get,list --resource=pods
+     k label clusterrole pod-reader rbac.example.com/aggregate-to-monitoring=true
+     ```
+  3. Kiểm chứng `monitoring-umbrella` đã tự động nhận `rules` từ `pod-reader`:
+     ```bash
+     k get clusterrole monitoring-umbrella -o yaml
+     ```
 - [ ] **Bài 2.8 — Upgrade để vá lỗ hổng (recognition):** `kubeadm upgrade plan`, `kubectl version`, `k get nodes -o wide`; nêu quy tắc skew (kubelet không cũ hơn apiserver quá 3 minor với kubelet ≥1.25). Không cần lab upgrade thật.
 
 **Drill phá hoại (failure injection):** tự xoá ClusterRoleBinding admin của user đang dùng → mọi lệnh `forbidden`; phục hồi bằng kubeconfig admin ngoài băng (hoặc apply lại file binding đã backup). Mục tiêu ≤5 phút, và phải chứng minh được **deny** chứ không chỉ allow.
@@ -168,14 +275,70 @@ crictl logs <container-id> | tail -20
 **Lab môi trường:** kubeadm node để load AppArmor profile và đặt seccomp profile dưới `/var/lib/kubelet/seccomp/`; kind cần `extraMounts` và không dùng được cho bài host OS.
 
 - [ ] **Bài 3.1 — seccomp RuntimeDefault:** pod-level `securityContext.seccompProfile.type: RuntimeDefault`; kiểm `k exec ... -- grep Seccomp /proc/1/status` → `Seccomp: 2`; đổi `Unconfined` → `Seccomp: 0` để thấy khác biệt.
-- [ ] **Bài 3.2 — seccomp Localhost:** đặt profile JSON dưới `/var/lib/kubelet/seccomp/profiles/` trên node, trỏ `localhostProfile: profiles/audit.json`; verify bằng `/proc/1/status`. Profile thiếu trên node = pod không start — đó là bài học, không phải lỗi lab.
-- [ ] **Bài 3.3 — AppArmor:** `apparmor_parser -r -W /etc/apparmor.d/<profile>`; `aa-status`; pod/container dùng `securityContext.appArmorProfile: {type: Localhost, localhostProfile: <profile>}`; verify bằng `/proc/1/attr/current`. Annotation `container.apparmor.security.beta.kubernetes.io/*` là dạng **legacy** — chỉ nhắc, không dạy làm chính.
+- [ ] **Bài 3.2 — seccomp Localhost (đặt file profile trên kubeadm node):**
+  *Lưu ý kubeadm:* vì cả `cks-master` và `cks-worker` đều nhận pod, đặt file seccomp trên **cả 2 node** (hoặc node mà pod được gán qua `nodeName`/`nodeSelector`) dưới thư mục gốc `/var/lib/kubelet/seccomp/`:
+  1. Trên node đích, tạo thư mục và file profile:
+     ```bash
+     sudo mkdir -p /var/lib/kubelet/seccomp/profiles
+     cat <<'EOF' | sudo tee /var/lib/kubelet/seccomp/profiles/audit.json
+     {"defaultAction": "SCMP_ACT_LOG"}
+     EOF
+     ```
+  2. Trong Pod/Container spec, khai báo đường dẫn **tương đối** tính từ `/var/lib/kubelet/seccomp/`:
+     ```yaml
+     securityContext:
+       seccompProfile:
+         type: Localhost
+         localhostProfile: profiles/audit.json
+     ```
+  3. Kiểm chứng: `k exec <pod> -- grep Seccomp /proc/1/status` → `Seccomp: 2`. Nếu thiếu file trên node pod được lập lịch → pod kẹt `CreateContainerError`.
+- [ ] **Bài 3.3 — AppArmor (phân biệt tên file và tên profile trên node):**
+  *Bẫy số 1 trong phòng thi:* `localhostProfile` nhận **tên profile bên trong file** (dòng `profile <tên-profile> ...`), **không** nhận đường dẫn file `/etc/apparmor.d/...`.
+  1. Trên node đích, đọc tên profile trong file, nạp vào kernel và kiểm tra:
+     ```bash
+     grep '^profile ' /etc/apparmor.d/k8s-deny-write
+     # ví dụ: profile k8s-deny-write flags=(attach_disconnected) {
+     sudo apparmor_parser -r -W /etc/apparmor.d/k8s-deny-write
+     sudo aa-status | grep k8s-deny-write
+     ```
+  2. Gắn vào Pod/Container (Kubernetes ≥1.30 dùng field chính thức, không dùng annotation beta cũ):
+     ```yaml
+     securityContext:
+       appArmorProfile:
+         type: Localhost
+         localhostProfile: k8s-deny-write
+     ```
+  3. Kiểm chứng từ trong pod:
+     ```bash
+     k exec <pod> -- cat /proc/1/attr/current   # k8s-deny-write (enforce)
+     ```
 - [ ] **Bài 3.4 — PodSecurity Admission:** `k label ns secure pod-security.kubernetes.io/enforce=restricted --overwrite` (thêm `warn`/`audit` và `*-version`); apply pod privileged → bị từ chối trước khi tạo, message `violates PodSecurity "restricted:latest"`; apply pod compliant → vào. So sánh 3 mode trên cùng namespace.
 - [ ] **Bài 3.5 — Capabilities:** `drop: ["ALL"]`, `add: ["NET_BIND_SERVICE"]`; `k exec ... -- grep Cap /proc/self/status` hoặc `capsh --print`. Nhớ: capabilities chỉ **container-level**, không có pod-level.
 - [ ] **Bài 3.6 — readOnlyRootFilesystem:** bật `true`, mount emptyDir vào `/tmp`; `touch /x` → Read-only file system, `touch /tmp/x` → OK.
 - [ ] **Bài 3.7 — Chặn host access:** dưới PSA restricted thử lần lượt `hostPath`, `hostPID`, `hostNetwork`, `privileged`; đọc đúng field bị báo vi phạm. Kết thúc bằng một policy/admission chặn `hostPath` (Kyverno hoặc PSA).
-- [ ] **Bài 3.8 — Host OS footprint (không test được trên kind):** `PermitRootLogin no` trong `/etc/ssh/sshd_config`, `systemctl list-unit-files --state=enabled`, `ss -tulpn` liệt kê dịch vụ listen; ghi chú minimal OS / giảm dịch vụ.
-- [ ] **Bài 3.9 — Runtime sandbox (recognition):** RuntimeClass gVisor (`runsc`) hoặc Kata; so `uname -r` trong pod sandbox với host.
+- [ ] **Bài 3.8 — Giảm bề mặt Host OS (dịch vụ thừa, port mở, SSH, sysctl trên kubeadm node):**
+  1. **Tìm và tắt dịch vụ giữ port không cần thiết** (đề thường yêu cầu dọn service đang listen trên một port cụ thể):
+     ```bash
+     sudo ss -tulpn | grep -E ':(80|21|23|8080)\b'   # tìm PID và tên tiến trình
+     systemctl status <pid>                          # xác định tên systemd unit
+     sudo systemctl disable --now <service>          # tắt và chặn tự chạy lại khi boot
+     ```
+  2. **Siết cấu hình SSH daemon** trong `/etc/ssh/sshd_config`:
+     ```bash
+     # Đặt PermitRootLogin no và PasswordAuthentication no
+     sudo sshd -t && sudo systemctl reload ssh
+     ```
+  3. **Kiểm tra kernel parameter (nếu đề yêu cầu):** sửa `/etc/sysctl.d/99-cks.conf` rồi áp dụng bằng `sudo sysctl --system`.
+- [ ] **Bài 3.9 — Runtime sandbox (kịch bản RuntimeClass trên kubeadm):**
+  1. Kiểm tra handler trong `/etc/containerd/config.toml` (ví dụ `runsc` cho gVisor hoặc `kata`) và tạo `RuntimeClass`:
+     ```yaml
+     apiVersion: node.k8s.io/v1
+     kind: RuntimeClass
+     metadata:
+       name: gvisor
+     handler: runsc
+     ```
+  2. Gắn `spec.runtimeClassName: gvisor` vào Pod/Deployment và kiểm chứng `k exec <pod> -- dmesg` hoặc `uname -r` khác với kernel của node.
 
 **Drill phá hoại (failure injection):** trỏ `localhostProfile` tới một profile **không tồn tại** → pod kẹt `CreateContainerConfigError`/runtime error. Chẩn đoán bằng `k describe pod` + `crictl ps -a` + log runtime, sửa về `RuntimeDefault`, verify pod Running và `Seccomp: 2`. Mục tiêu ≤6 phút.
 
@@ -204,15 +367,63 @@ crictl logs <container-id> | tail -20
 
 - [ ] **Bài 4.1 — securityContext đầy đủ:** `runAsNonRoot: true`, `runAsUser: 1000`, `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`, `drop: ["ALL"]`; verify `k exec ... -- id` = uid 1000. Thử image nginx root → `CreateContainerConfigError`, sửa bằng image unprivileged.
 - [ ] **Bài 4.2 — Secret 2 cách:** cùng secret mount file `defaultMode: 0400` và inject env; `k exec -- cat /etc/sec/pw` vs `k exec -- env`; `k exec -- cat /proc/1/environ` cho thấy env lộ trong proc — lý do ưu tiên file mount.
-- [ ] **Bài 4.3 — Encryption at rest (drill chính):** snapshot etcd trước. Key: `head -c 32 /dev/urandom | base64`. EncryptionConfiguration `apiVersion: apiserver.config.k8s.io/v1`, provider `aescbc` + `identity` fallback (**aescbc là simplification cho lab**; production dùng `secretbox` hoặc KMS v2 — KMS v1 deprecated/disabled mặc định từ 1.29). Mount file + `--encryption-provider-config`, chờ apiserver restart, tạo secret rồi đọc raw:
-  ```bash
-  ETCDCTL_API=3 etcdctl --cacert=... --cert=... --key=... get /registry/secrets/default/s1
-  # phải thấy prefix k8s:enc:aescbc:v1:
-  ```
-- [ ] **Bài 4.4 — Rewrite toàn bộ secret + verify:** `k get secrets -A -o json | k replace -f -`; đọc lại raw etcd thấy prefix, không thấy plaintext. Giữ `identity` để đọc dữ liệu cũ; chỉ bỏ key cũ sau khi verify.
-- [ ] **Bài 4.5 — Admission policy:** cài Kyverno (pin chart version), ClusterPolicy chặn `privileged` + bắt buộc `runAsNonRoot`/`seccompProfile`; pod vi phạm bị deny (đọc event/message), pod hợp lệ được nhận. Kiểm `failurePolicy`.
+- [ ] **Bài 4.3 — Encryption at rest trên kubeadm (drill chính):**
+  1. **Tạo file cấu hình `/etc/kubernetes/enc/enc.yaml`** (đặt `aescbc` đứng đầu để mã hoá secret mới, `identity: {}` đứng sau để vẫn đọc được secret cũ chưa mã hoá):
+     ```bash
+     sudo mkdir -p /etc/kubernetes/enc
+     KEY=$(head -c 32 /dev/urandom | base64)
+     cat <<EOF | sudo tee /etc/kubernetes/enc/enc.yaml
+     apiVersion: apiserver.config.k8s.io/v1
+     kind: EncryptionConfiguration
+     resources:
+       - resources: ["secrets"]
+         providers:
+           - aescbc:
+               keys:
+                 - name: key1
+                   secret: ${KEY}
+           - identity: {}
+     EOF
+     sudo chmod 600 /etc/kubernetes/enc/enc.yaml
+     ```
+  2. **Mount thư mục `/etc/kubernetes/enc` vào static pod `kube-apiserver`:**
+     *Bẫy số 1 trên kubeadm:* nếu thêm cờ `--encryption-provider-config=/etc/kubernetes/enc/enc.yaml` mà quên thêm `volumeMounts` + `volumes` (`hostPath.path: /etc/kubernetes/enc`, `type: DirectoryOrCreate`) trong `/etc/kubernetes/manifests/kube-apiserver.yaml` thì `kube-apiserver` sẽ crash vì không thấy file trong container.
+  3. **Kiểm chứng từ etcd raw:**
+     ```bash
+     k create secret generic s1 --from-literal=pw=supersecret
+     sudo ETCDCTL_API=3 etcdctl \
+       --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+       --cert=/etc/kubernetes/pki/etcd/server.crt \
+       --key=/etc/kubernetes/pki/etcd/server.key \
+       get /registry/secrets/default/s1 | hexdump -C
+     # Phải thấy prefix k8s:enc:aescbc:v1:key1 và KHÔNG thấy chuỗi "supersecret"
+     ```
+- [ ] **Bài 4.4 — Rewrite toàn bộ secret + xoay/huỷ mã hoá (decrypt all secrets):**
+  - **Mã hoá toàn bộ secret cũ:** `k get secrets -A -o json | k replace -f -`.
+  - **Kịch bản ngược (đề yêu cầu giải mã toàn bộ secret về plaintext):** đổi thứ tự trong `enc.yaml` đưa `- identity: {}` lên **đầu tiên**, giữ `- aescbc:` ở **thứ hai** (để đọc được secret đang mã hoá), chờ apiserver restart, chạy `k get secrets -A -o json | k replace -f -`, kiểm tra etcd raw thấy plaintext rồi mới xoá hẳn khối `aescbc`.
+- [ ] **Bài 4.5 — Admission policy (Kyverno chart offline hoặc ValidatingAdmissionPolicy):**
+  1. Cài Kyverno từ chart đã cache sẵn trên node (`helm install kyverno /opt/cks/charts/kyverno-*.tgz -n kyverno --create-namespace`) hoặc sửa `ClusterPolicy` có sẵn trong đề.
+  2. Đặt `validationFailureAction: Enforce` (chú ý chữ hoa `Enforce` ở bản mới) chặn `spec.containers[*].securityContext.privileged: true` và bắt buộc `runAsNonRoot: true`.
+  3. Thử tạo pod `privileged: true` → bị webhook từ chối ngay; tạo pod hợp lệ → Running.
 - [ ] **Bài 4.6 — Isolation theo microservice:** mỗi service 1 namespace + PSA restricted + default-deny (tái dùng 1.1/3.4) + ResourceQuota; chứng minh service này không gọi được service kia ngoài allow.
-- [ ] **Bài 4.7 — Pod-to-Pod encryption:** Cilium WireGuard **hoặc** Istio `PeerAuthentication` mode `STRICT`; verify plaintext từ pod ngoài mesh fail, từ pod trong mesh OK. Tool cụ thể có thể không xuất hiện trong đề — học **control + cách verify**.
+- [ ] **Bài 4.7 — Mã hoá Pod-to-Pod (kịch bản kubeadm + Calico WireGuard và Istio mTLS):**
+  1. **Trực tiếp trên lab kubeadm (Calico CNI):** bật mã hoá WireGuard giữa các node:
+     ```bash
+     k patch felixconfiguration default --type=merge -p '{"spec":{"wireguardEnabled":true}}'
+     k get node cks-master cks-worker -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.annotations.projectcalico\.org/WireguardPublicKey}{"\n"}{end}'
+     ip link show wireguard.cali
+     ```
+  2. **Kịch bản Istio trong đề thi:** bật tự động chèn proxy trên namespace (`k label ns prod istio-injection=enabled --overwrite`), rollout restart deployment, và áp `PeerAuthentication` bắt buộc mTLS nghiêm ngặt:
+     ```yaml
+     apiVersion: security.istio.io/v1
+     kind: PeerAuthentication
+     metadata:
+       name: default
+       namespace: prod
+     spec:
+       mtls:
+         mode: STRICT
+     ```
 - [ ] **Bài 4.8 — RuntimeClass sandbox (tùy chọn):** gVisor/Kata; verify `uname -r` khác host, và policy bắt buộc runtimeClass nếu có.
 
 **Drill phá hoại (failure injection):** tạo secret với key A, sau đó đổi EncryptionConfiguration sang key B **không còn identity** → secret cũ không đọc được (`k get secret` lỗi/decrypt fail). Phục hồi: trả `identity` + key A, restart, verify đọc lại được; nếu hỏng nặng, restore từ etcd snapshot. Bài này dạy đúng rủi ro thật — chỉ làm trên lab có snapshot.
@@ -242,16 +453,70 @@ crictl logs <container-id> | tail -20
 
 **Lab môi trường:** registry nội bộ + image đã pull sẵn; Trivy DB pre-download (`--skip-db-update`); cosign keypair throwaway; không commit private key.
 
-- [ ] **Bài 5.1 — Scan image:** `trivy image --severity HIGH,CRITICAL --exit-code 1 nginx:1.27` (offline: `--skip-db-update`). Ghi 1 CVE + fixed version + gate threshold.
-- [ ] **Bài 5.2 — Static analysis manifest:** `kubesec scan pod.yaml`; `kube-linter lint .`; hoặc `k apply --dry-run=server` vào ns restricted để bắt vi phạm trước deploy.
-- [ ] **Bài 5.3 — Pin theo digest:** `crane digest nginx:1.27` hoặc `docker buildx imagetools inspect`; deploy `image: nginx@sha256:...`; verify `k get pod -o jsonpath='{.spec.containers[0].image}'` chứa `@sha256:`, không phải tag.
-- [ ] **Bài 5.4 — Ký/verify:** `cosign generate-key-pair`; `cosign sign --key cosign.key <registry>/app@sha256:...`; `cosign verify --key cosign.pub ...` pass; verify image khác hoặc key khác → fail. Keyless cần OIDC — lab offline dùng keypair.
-- [ ] **Bài 5.5 — Policy chặn unsigned:** Kyverno ClusterPolicy `verifyImages` với attestor public key; apply pod image unsigned → deny; image đã ký → admit. Kiểm `failurePolicy: Fail` và webhook có trong `k get validatingwebhookconfiguration`.
-- [ ] **Bài 5.6 — ImagePolicyWebhook (recognition + drill nhỏ):** AdmissionConfiguration + kubeconfig trỏ webhook; thêm `--enable-admission-plugins=NodeRestriction,ImagePolicyWebhook` + `--admission-control-config-file`; `defaultAllow: false` chứng minh chặn mọi image, rồi allowlist 1 image.
-- [ ] **Bài 5.7 — Giới hạn registry:** netpol egress chỉ allow registry IP:443; `k exec -- wget -T2 https://registry.k8s.io` timeout, registry nội bộ OK. Hoặc admission policy chỉ cho registry đã duyệt.
-- [ ] **Bài 5.8 — SBOM:** `trivy image --format spdx-json -o sbom.json nginx:1.27`; đếm package, tìm 1 package có CVE trong SBOM.
+- [ ] **Bài 5.1 — Quét CVE của image trên kubeadm node (online & offline):**
+  1. Quét toàn bộ pod đang chạy hoặc file tar đã cache sẵn trong `/opt/cks`:
+     ```bash
+     k get pods -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"\t"}{.spec.containers[*].image}{"\n"}{end}'
+     trivy image --cache-dir /opt/cks/trivy --skip-db-update --offline-scan \
+       --severity HIGH,CRITICAL --input /opt/cks/images/alpine.tar
+     ```
+  2. Nếu đề yêu cầu xoá pod có CVE `CRITICAL` hoặc tìm CVE cụ thể (ví dụ `CVE-2024-...`): lọc bằng `trivy image --severity CRITICAL <image>`, đối chiếu danh sách pod rồi `k -n <ns> delete pod <pod>` (hoặc hạ scale Deployment).
+- [ ] **Bài 5.2 — Static analysis manifest trước khi apply:**
+  Trên lab offline, truyền đường dẫn schema đã cache trong `/opt/cks/schemas`:
+  ```bash
+  SCHEMA_LOCATION='/opt/cks/schemas/{{.ResourceKind}}{{.KindSuffix}}.json' kubesec scan pod.yaml
+  kube-linter lint pod.yaml
+  k apply -f pod.yaml --dry-run=server   # kiểm tra admission/PSA của cluster mà chưa tạo thật
+  ```
+- [ ] **Bài 5.3 — Pin image theo digest (`@sha256:`) bằng `crictl` trên kubeadm:**
+  Trên node kubeadm + containerd (không có `docker` hay `crane`), lấy digest trực tiếp từ runtime:
+  ```bash
+  sudo crictl images --digests
+  sudo crictl inspecti busybox:1.37.0 | jq -r '.status.repoDigests[0]'
+  # Sửa manifest sang: image: docker.io/library/busybox@sha256:a7dbc3...
+  k get pod <pod> -o jsonpath='{.spec.containers[0].image}'   # phải chứa @sha256:
+  ```
+- [ ] **Bài 5.4 — Ký và xác thực bằng Cosign (offline keypair):**
+  Khi không có OIDC/Rekor internet, thêm `--tlog-upload=false` lúc ký và `--insecure-ignore-tlog` lúc verify:
+  ```bash
+  COSIGN_PASSWORD="" cosign generate-key-pair
+  # Với image trong registry nội bộ:
+  COSIGN_PASSWORD="" cosign sign --key cosign.key --tlog-upload=false <registry>/app@sha256:...
+  cosign verify --key cosign.pub --insecure-ignore-tlog <registry>/app@sha256:...
+  # Hoặc ký/verify artifact/tarball cục bộ trên node:
+  COSIGN_PASSWORD="" cosign sign-blob --key cosign.key --tlog-upload=false \
+    --bundle app.bundle /opt/cks/images/alpine.tar
+  cosign verify-blob --key cosign.pub --insecure-ignore-tlog \
+    --bundle app.bundle /opt/cks/images/alpine.tar
+  ```
+- [ ] **Bài 5.5 — Policy chặn image chưa ký:** Kyverno `ClusterPolicy` dùng `verifyImages` với public key (`attestors.entries.keys.publicKeys`); apply pod dùng image chưa ký → bị deny; image đã ký → admit. Kiểm `failurePolicy: Fail` và `k get validatingwebhookconfiguration`.
+- [ ] **Bài 5.6 — ImagePolicyWebhook trên kubeadm (drill trọng tâm):**
+  1. **Sửa file `AdmissionConfiguration`** (thường ở `/etc/kubernetes/admission/admission-config.yaml`):
+     - Đặt `defaultAllow: false` (bắt buộc fail-closed khi webhook từ chối hoặc sập).
+     - Trỏ `kubeConfigFile: /etc/kubernetes/admission/webhook-kubeconfig.yaml`.
+  2. **Kiểm tra file `webhook-kubeconfig.yaml`:** điền đúng `clusters[0].cluster.server: https://<webhook-service>/...` và cert theo đề.
+  3. **Bật trên `/etc/kubernetes/manifests/kube-apiserver.yaml`:**
+     - Thêm `ImagePolicyWebhook` vào `--enable-admission-plugins=NodeRestriction,ImagePolicyWebhook`.
+     - Thêm `--admission-control-config-file=/etc/kubernetes/admission/admission-config.yaml`.
+     - Đảm bảo thư mục `/etc/kubernetes/admission` đã được mount vào `volumeMounts` + `volumes` của `kube-apiserver`.
+  4. **Kiểm chứng:** chờ `kube-apiserver` chạy lại, thử `k run test --image=nginx:latest` → bị webhook từ chối.
+- [ ] **Bài 5.7 — Giới hạn registry được phép (whitelist registry):**
+  1. **Kiểm tra workload hiện có:** liệt kê mọi pod không kéo từ registry chuẩn (ví dụ chỉ cho phép `registry.k8s.io/*` hoặc `gcr.io/*`):
+     ```bash
+     k get pods -A -o json | jq -r '.items[] | select(.spec.containers[].image | startswith("registry.k8s.io/") | not) | "\(.metadata.namespace)/\(.metadata.name)"'
+     ```
+  2. **Chặn từ cổng admission:** dùng Kyverno `ClusterPolicy` / OPA `Constraint` hoặc `ValidatingAdmissionPolicy` với biểu thức `cel`: `object.spec.containers.all(c, c.image.startsWith('registry.internal:5000/'))`.
+- [ ] **Bài 5.8 — Xuất và đọc SBOM bằng Trivy:**
+  ```bash
+  trivy image --cache-dir /opt/cks/trivy --skip-db-update --offline-scan \
+    --format spdx-json -o sbom.json --input /opt/cks/images/alpine.tar
+  jq '.packages | length' sbom.json
+  ```
 - [ ] **Bài 5.9 — Private registry:** `k create secret docker-registry regcred ...` + `imagePullSecrets`; verify pod pull được, và pod không có secret thì `ErrImagePull`.
-- [ ] **Bài 5.10 — Dockerfile baseline (recognition):** base tối giản, non-root USER, không secret trong layer, multi-stage; liên hệ vì sao ít package = ít CVE.
+- [ ] **Bài 5.10 — Audit Dockerfile & Kubernetes YAML tĩnh (recognition + sửa lỗi):**
+  Khi đề cho một `Dockerfile` và một `deployment.yaml` nhưng yêu cầu **không được build/chạy**, tìm và sửa đúng dòng:
+  - Trong `Dockerfile`: đổi base image sang bản cụ thể (bỏ `:latest`), xoá `USER root` ở cuối và thay bằng `USER 1000` (hoặc tên user non-root có sẵn), xoá `ENV SECRET=...`/`ADD` từ URL lạ.
+  - Trong `deployment.yaml`: đặt `readOnlyRootFilesystem: true`, `runAsNonRoot: true`, `runAsUser: 1000`, `privileged: false`.
 
 **Drill phá hoại (failure injection):** ký image bằng key A nhưng policy chỉ trust key B → `cosign verify` fail và pod bị deny. Sửa theo 2 hướng (ký lại bằng B, hoặc cập nhật public key trong policy), verify pod được admit. Mục tiêu ≤8 phút.
 
@@ -280,17 +545,95 @@ crictl logs <container-id> | tail -20
 
 **Lab môi trường:** VM có kernel headers/BTF cho Falco (WSL2/kind hay fail eBPF — ghi Blocked, không tắt cơ chế bảo mật kernel); audit path là `hostPath` với giới hạn dung lượng.
 
-- [ ] **Bài 6.1 — Audit policy:** viết `audit.k8s.io/v1` policy `level: Metadata` cho secrets, `RequestResponse` cho `pods/exec`, `None` cho noisy read; mount file + `--audit-policy-file` + `--audit-log-path=/var/log/kubernetes/audit.log` + `--audit-log-maxsize/maxbackup/maxage`. Chỉ `audit.k8s.io/v1` tồn tại (v1beta1/v1alpha1 đã bị bỏ từ 1.24).
+- [ ] **Bài 6.1 — Audit policy trên kubeadm (drill chính):**
+  1. **Viết file `/etc/kubernetes/audit/policy.yaml` (`audit.k8s.io/v1`):**
+     *Nguyên tắc:* rule khớp **từ trên xuống dưới** (first-match wins) — đặt các rule cụ thể lên trước, rule catch-all ở cuối cùng:
+     ```yaml
+     apiVersion: audit.k8s.io/v1
+     kind: Policy
+     omitStages:
+       - "RequestReceived"
+     rules:
+       - level: RequestResponse
+         resources:
+           - group: ""
+             resources: ["pods/exec", "pods/attach"]
+       - level: Metadata
+         resources:
+           - group: ""
+             resources: ["secrets"]
+       - level: None
+         verbs: ["get", "list", "watch"]
+       - level: Metadata
+     ```
+  2. **Khai báo cờ và mount vào `/etc/kubernetes/manifests/kube-apiserver.yaml`:**
+     - Thêm cờ:
+       - `--audit-policy-file=/etc/kubernetes/audit/policy.yaml`
+       - `--audit-log-path=/var/log/kubernetes/audit/audit.log`
+       - `--audit-log-maxage=30`
+       - `--audit-log-maxbackup=10`
+       - `--audit-log-maxsize=100`
+     - *Bẫy số 1 trên kubeadm:* nên mount **thư mục** `/etc/kubernetes/audit` và `/var/log/kubernetes/audit` (`type: DirectoryOrCreate`) thay vì mount lẻ file log chưa tồn tại (`FileOrCreate` dễ lệch quyền/path làm `kube-apiserver` không lên).
 - [ ] **Bài 6.2 — Sinh và tìm event:** `k get secret s1`, `k exec -it p -- sh`, tạo pod; rồi:
   ```bash
-  grep '"resource":"secrets"' /var/log/kubernetes/audit.log | tail -1 | jq '.verb,.user.username,.objectRef'
+  sudo grep '"resource":"secrets"' /var/log/kubernetes/audit/audit.log | tail -1 | jq '.verb,.user.username,.objectRef'
   ```
   Phải thấy `verb: get`, user cụ thể, objectRef đúng.
-- [ ] **Bài 6.3 — Audit chứng minh identity:** tạo user bằng CSR/client cert, thao tác, rồi tìm `user.username` = CN trong audit log. (Ghép với Domain 2.) Giải thích 3 mức audit và lý do chọn.
-- [ ] **Bài 6.4 — Falco:** cài từ chart đã pin/preinstall; `k exec -it nginx -- sh`; `k logs -n falco -l app.kubernetes.io/name=falco -c falco | grep -i 'Terminal shell in container'` — ghi rule name + output field.
-- [ ] **Bài 6.5 — Custom Falco rule:** rule bắt đọc `/etc/shadow` hoặc ghi `/usr/bin`; nạp qua ConfigMap/`-r`/helm values; reload; trigger và thấy alert mới. Hiểu `condition`, `output`, `priority`.
-- [ ] **Bài 6.6 — Immutability:** `readOnlyRootFilesystem: true` + `emptyDir` cho path cần ghi; Falco phát hiện nỗ lực ghi/exec; digest pin để container không bị thay. Đây là objective riêng, không chỉ là bài 3.6.
-- [ ] **Bài 6.7 — Incident response:** pod bị compromise giả lập (privileged/hostPath, chạy shell). Trình tự: `k cordon <node>`, quarantine NetworkPolicy (deny-all + allow-only-forensics), `k logs --previous`, `crictl ps/logs`, chụp `imageID` + process tree, **rồi mới** xoá pod. Chứng minh traffic bị chặn và bằng chứng đã lưu.
+- [ ] **Bài 6.3 — Audit chứng minh identity & 4 mức độ log:**
+  1. Tạo thao tác dưới danh tính cụ thể (dùng `--as=jane` hoặc token của ServiceAccount) rồi truy vết trong `audit.log`:
+     ```bash
+     k get secret s1 -n default --as=jane
+     sudo jq -c 'select(.impersonatedUser.username == "jane") | {verb, user: .user.username, impersonated: .impersonatedUser.username, res: .objectRef.resource}' /var/log/kubernetes/audit/audit.log
+     ```
+  2. Nắm chắc **4 mức Audit** và lý do chọn:
+     - `None`: không ghi (dùng cho endpoint ồn ào như `watch`, `/healthz`, `system:kube-proxy`).
+     - `Metadata`: chỉ ghi ai/lúc nào/resource nào, **không** ghi body (bắt buộc dùng cho `secrets` để không làm lộ dữ liệu nhạy cảm dạng plaintext ra file log!).
+     - `Request`: ghi metadata + request payload.
+     - `RequestResponse`: ghi cả request + response payload (dùng cho thao tác nguy hiểm như `pods/exec`, thay đổi `deployments`/`roles`).
+- [ ] **Bài 6.4 — Phát hiện xâm nhập runtime bằng Falco (systemd trên node & DaemonSet):**
+  Trên đề thi và lab kubeadm, Falco có thể chạy dưới dạng **systemd service trên node** (`systemctl status falco`) hoặc **DaemonSet trong cluster** (`helm install falco /opt/cks/charts/falco-*.tgz -n falco --create-namespace`):
+  ```bash
+  # Kích hoạt cảnh báo mẫu:
+  k exec -it <pod> -- sh -c "cat /etc/shadow >/dev/null || true"
+  # Nếu Falco chạy systemd trên node:
+  sudo journalctl -u falco --no-pager | grep -iE 'shadow|shell'
+  # Nếu Falco chạy DaemonSet:
+  k logs -n falco -l app.kubernetes.io/name=falco -c falco | grep -iE 'shadow|shell'
+  ```
+- [ ] **Bài 6.5 — Viết/sửa Custom Falco rule (`/etc/falco/falco_rules.local.yaml`):**
+  *Nguyên tắc:* không sửa trực tiếp `/etc/falco/falco_rules.yaml`; luôn đặt rule mới hoặc ghi đè (`override:` / `append:`) trong `/etc/falco/falco_rules.local.yaml`:
+  ```yaml
+  - rule: Write below binary dir
+    desc: Detect any attempt to write to /usr/bin or /bin inside a container
+    condition: >
+      open_write and container and
+      (fd.name startswith /usr/bin/ or fd.name startswith /bin/)
+    output: >
+      Binary dir write detected (user=%user.name container_id=%container.id
+      image=%container.image.repository file=%fd.name cmdline=%proc.cmdline)
+    priority: CRITICAL
+  ```
+  Sau khi lưu: `sudo systemctl restart falco` (hoặc xoá pod Falco để reload ConfigMap), chạy lệnh vi phạm trong pod và kiểm tra dòng log sinh ra đúng định dạng `output` đề yêu cầu.
+- [ ] **Bài 6.6 — Immutability (container bất biến từ đầu tới cuối):**
+  Khi đề yêu cầu biến một Deployment thành stateless/immutable:
+  1. Đặt `readOnlyRootFilesystem: true`, `runAsNonRoot: true`, `allowPrivilegeEscalation: false`, xoá `privileged: true`.
+  2. Nếu ứng dụng cần ghi file tạm/cache/pid (ví dụ `/tmp`, `/var/cache/nginx`, `/var/run`), thêm `volumes: [{name: tmp, emptyDir: {}}]` và `volumeMounts` vào đúng đường dẫn đó.
+  3. Kiểm chứng: pod lên `Running`, `k exec <pod> -- touch /usr/test` báo `Read-only file system`, còn `touch /tmp/test` thành công.
+- [ ] **Bài 6.7 — Incident response & điều tra container trên kubeadm node:**
+  Khi đề báo có một pod đáng ngờ (chạy tiến trình đào coin / mở shell / đọc file nhạy cảm trên host):
+  1. **Xác định node, container ID và PID trên host:**
+     ```bash
+     k get pods -A -o wide                                  # tìm node đang chạy pod
+     # SSH vào node đó:
+     sudo crictl ps --name <container-name>                 # lấy CONTAINER ID
+     CID=<container-id>
+     PID=$(sudo crictl inspect "$CID" | jq '.info.pid')     # lấy PID thật trên host OS
+     ps -ef --forest | grep -C3 "$PID"                      # xem cây tiến trình và lệnh đang chạy
+     sudo ls -l "/proc/$PID/exe" "/proc/$PID/cwd"           # xem binary thật đang thực thi
+     ```
+  2. **Lưu bằng chứng + cô lập trước khi xoá:**
+     - Ghi lại `namespace/pod`, `imageID` (`sudo crictl inspect "$CID" | jq -r '.status.imageRef'`), PID hoặc file log theo đúng đường dẫn đề yêu cầu.
+     - Áp `NetworkPolicy` cô lập pod (chặn toàn bộ Ingress + Egress) hoặc `k cordon <node>`, sau đó mới `k delete pod` / `k scale deploy --replicas=0`.
 - [ ] **Bài 6.8 — Kill chain:** dựng chuỗi initial access (exec) → persistence (tạo SA/token) → exfiltration (egress bị netpol chặn), rồi ghép **audit + Falco + events** để kể lại từng bước. Đề CKS không chia silo domain.
 - [ ] **Bài 6.9 — Quan sát nhanh:** `k top pod --containers`, `k get events --sort-by=.metadata.creationTimestamp`, `k get events --field-selector type=Warning`, `k logs --previous`.
 
@@ -414,16 +757,16 @@ crictl ps -a ; crictl logs <id>
 grep '"resource":"secrets"' /var/log/kubernetes/audit.log | tail -1 | jq '.verb,.user.username'
 
 # CIS / binary
-kube-bench --targets controlplane   # hoặc job YAML đã pin
-sha512sum kube-apiserver             # so với .sha512 cùng release
+kube-bench run --targets master,node
+echo "$(cat kubelet.sha512)  /usr/bin/kubelet" | sha512sum -c -
 
-# Image supply chain
-trivy image --severity HIGH,CRITICAL --exit-code 1 --skip-db-update nginx:1.27
-trivy image --format spdx-json -o sbom.json nginx:1.27
-crane digest nginx:1.27
-cosign sign --key cosign.key <registry>/app@sha256:...
-cosign verify --key cosign.pub <registry>/app@sha256:...
-kubesec scan pod.yaml ; kube-linter lint .
+# Image supply chain (kubeadm + containerd + /opt/cks offline cache)
+trivy image --cache-dir /opt/cks/trivy --skip-db-update --offline-scan --severity HIGH,CRITICAL --input /opt/cks/images/alpine.tar
+trivy image --cache-dir /opt/cks/trivy --skip-db-update --offline-scan --format spdx-json -o sbom.json --input /opt/cks/images/alpine.tar
+sudo crictl inspecti busybox:1.37.0 | jq -r '.status.repoDigests[0]'
+COSIGN_PASSWORD="" cosign sign --key cosign.key --tlog-upload=false <registry>/app@sha256:...
+cosign verify --key cosign.pub --insecure-ignore-tlog <registry>/app@sha256:...
+SCHEMA_LOCATION='/opt/cks/schemas/{{.ResourceKind}}{{.KindSuffix}}.json' kubesec scan pod.yaml ; kube-linter lint pod.yaml
 
 # AppArmor / seccomp
 apparmor_parser -r -W /etc/apparmor.d/<profile> ; aa-status

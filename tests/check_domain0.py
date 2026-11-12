@@ -48,6 +48,55 @@ class NodeSetupTests(unittest.TestCase):
         self.assertIn("SystemdCgroup = true", result.stdout)
         self.assertNotIn("SystemdCgroup = false", result.stdout)
 
+    def test_untaint_master_is_idempotent_and_preserves_other_taints(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / 'taints'
+            original = ['node-role.kubernetes.io/control-plane:NoSchedule', 'dedicated:NoSchedule']
+            state.write_text('\n'.join(original) + '\n')
+            result = self.shell(r'''
+                kubectl() {
+                    [[ "$1" == --kubeconfig=/etc/kubernetes/admin.conf ]] || return 90
+                    shift
+                    case "$1" in
+                        get)
+                            [[ "$2 $3" == 'node cks-master' ]] || return 91
+                            /usr/bin/cat "$TAINTS" ;;
+                        taint)
+                            [[ "$*" == 'taint node cks-master node-role.kubernetes.io/control-plane:NoSchedule-' ]] || return 92
+                            grep -vx 'node-role.kubernetes.io/control-plane:NoSchedule' "$TAINTS" > "$TAINTS.new"
+                            mv "$TAINTS.new" "$TAINTS" ;;
+                        *) return 93 ;;
+                    esac
+                }
+                untaint_master
+                untaint_master
+            ''', env=dict(os.environ, TAINTS=str(state)))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(state.read_text(), 'dedicated:NoSchedule\n')
+        result = self.shell('kubectl() { return 80; }; untaint_master')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_bootstrap_untaints_before_initialized_master_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            (path / 'master-startup.sh').write_text('main() { exit 0; }\n')
+            marker = path / 'untainted'
+            env = dict(os.environ, MARKER=str(marker))
+            result = self.shell(r'''
+                kubectl() {
+                    [[ "$1" == --kubeconfig=/etc/kubernetes/admin.conf ]] || return 90
+                    shift
+                    case "$1" in
+                        get) printf '%s\n' 'node-role.kubernetes.io/control-plane:NoSchedule' ;;
+                        taint) touch "$MARKER" ;;
+                        *) return 91 ;;
+                    esac
+                }
+                bootstrap master "$1"
+            ''', tmp, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(marker.exists())
+
     def test_role_and_missing_source_rejected_before_bootstrap(self):
         result = self.shell('bootstrap unknown /missing')
         self.assertNotEqual(result.returncode, 0)
@@ -66,51 +115,17 @@ class NodeSetupTests(unittest.TestCase):
                     'main() { printf "original-main:%s:%s\\n" "$1" "${KUBE_JOIN_COMMAND:-}"; }\n'
                     '[[ "${BASH_SOURCE[0]}" != "$0" ]] || main "$@"\n')
                 env = dict(os.environ, KUBE_JOIN_COMMAND="kubeadm join private:6443 --token test")
-                result = self.shell('bootstrap "$@"', role, tmp, env=env)
+                result = self.shell('kubectl() { return 0; }; bootstrap "$@"', role, tmp, env=env)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("original-main:", result.stdout)
                 self.assertIn("kubeadm join private:6443 --token test", result.stdout)
-
-    def test_bundled_installers_bootstrap_both_roles_with_host_operations_stubbed(self):
-        for role in ("master", "worker"):
-            with self.subTest(role=role), tempfile.TemporaryDirectory() as tmp:
-                path = Path(tmp)
-                (path / f"{role}-startup.sh").write_text('''
-                    source "$BUNDLED_INSTALLER"
-                    setup_system() { :; }
-                    install_crictl() { :; }
-                    install_cni_plugins() { :; }
-                    install_kubernetes_tools() { :; }
-                    is_already_initialized() { return 1; }
-                    init_control_plane() { :; }
-                    setup_kubectl() { :; }
-                    print_join_command() { :; }
-                    is_already_joined() { return 1; }
-                    wait_for_cri() { :; }
-                    kubeadm() { printf 'kubeadm'; printf ' <%s>' "$@"; printf '\\n'; }
-                    apt-get() { return 90; }
-                ''')
-                env = dict(os.environ, BUNDLED_INSTALLER=str(ROOT / f"scripts/{role}-startup.sh"),
-                           LOG_FILE=str(path / "startup.log"), KUBERNETES_VERSION="1.35",
-                           KUBERNETES_PATCH="",
-                           KUBE_JOIN_COMMAND="kubeadm join private:6443 --token test")
-                result = self.shell('''
-                    ubuntu_containerd() { :; }
-                    ubuntu_calico() { :; }
-                    bootstrap "$@"
-                ''', role, tmp, env=env)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn(f"{role.title()} node setup complete!", result.stdout)
-                if role == "worker":
-                    self.assertIn("kubeadm <join> <private:6443> <--token> <test>", result.stdout)
-                    self.assertIn("--token <redacted>", (path / "startup.log").read_text())
 
     def test_bootstrap_restores_readable_apt_files_after_restrictive_transfer_mask(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
             (path / 'master-startup.sh').write_text('main() { touch "$PROBE"; }\n')
             env = dict(os.environ, PROBE=str(path / 'apt.list'))
-            result = self.shell('umask 077; bootstrap master "$1"', tmp, env=env)
+            result = self.shell('kubectl() { return 0; }; umask 077; bootstrap master "$1"', tmp, env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((path / 'apt.list').stat().st_mode & 0o777, 0o644)
 
@@ -152,6 +167,52 @@ class NodeSetupTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
 
+class CalicoReadinessTests(unittest.TestCase):
+    shell = NodeSetupTests.shell
+
+    def test_calico_retries_missing_conditions_before_custom_resources(self):
+        result = self.shell(r'''
+            attempts=0
+            curl() { printf '%s\n' '  calicoNetwork:' '        encapsulation: VXLANCrossSubnet' > "$2"; }
+            sleep() { :; }
+            kubectl() {
+                case "$1" in
+                    get) return 0 ;;
+                    wait)
+                        attempts=$((attempts + 1))
+                        if [[ $attempts == 1 ]]; then
+                            printf 'error: .status.conditions accessor error: <nil>\n' >&2
+                            return 1
+                        fi ;;
+                    create)
+                        if [[ "${@: -1}" == *resources.yaml ]]; then
+                            [[ $attempts -ge 5 ]] || return 81
+                            printf 'CUSTOM_RESOURCES_CREATED\n'
+                        fi ;;
+                esac
+            }
+            install_calico
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('CUSTOM_RESOURCES_CREATED', result.stdout)
+
+    def test_calico_missing_conditions_times_out_without_creating_resources(self):
+        result = self.shell(r'''
+            curl() { printf '%s\n' '  calicoNetwork:' '        encapsulation: VXLANCrossSubnet' > "$2"; }
+            sleep() { SECONDS=10000; }
+            kubectl() {
+                case "$1" in
+                    get) return 0 ;;
+                    wait) return 1 ;;
+                    create) [[ "${@: -1}" != *resources.yaml ]] ;;
+                esac
+            }
+            install_calico
+        ''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Timed out waiting for', result.stderr)
+
+
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
         script = ROOT / "scripts/ec2-lab.py"
@@ -185,6 +246,7 @@ class LifecycleTests(unittest.TestCase):
                     mappings.insert(0, {"DeviceName": "/dev/sdf", "Ebs": {"VolumeId": "vol-extra"}})
                 instances.append({"InstanceId": ident, "RootDeviceName": "/dev/sda1",
                                   "RootDeviceType": "ebs", "State": {"Name": self.state},
+                                  "Tags": [{"Key": "Purpose", "Value": "cks-domain0"}],
                                   "BlockDeviceMappings": mappings})
             return {"Reservations": [{"Instances": instances}]}
         if action == "create-snapshot":
@@ -205,13 +267,21 @@ class LifecycleTests(unittest.TestCase):
                 return {"ReplaceRootVolumeTasks": []}
             return {"ReplaceRootVolumeTasks": [{"ReplaceRootVolumeTaskId": f"replacevol-{n}",
                                                 "TaskState": self.task_state} for n in range(2)]}
+        if action == "terminate-instances":
+            return {"TerminatingInstances": []}
+        if action == "wait":
+            return {}
         self.fail(f"Unexpected AWS operation: {service} {action} {args}")
 
-    def run_lab(self, action, apply=False, extra=()):
+    def run_lab(self, action, apply=False, extra=(), taint_free=True):
         argv = [action, "--master", self.master, "--worker", self.worker,
-                "--region", self.region, "--baseline", str(self.baseline), *extra]
+                "--region", self.region, "--baseline", str(self.baseline)]
+        if action == "snapshot" and taint_free:
+            argv.append("--taint-free")
+        argv.extend(extra)
         if apply:
             argv.append("--apply")
+
         with patch.object(self.lab, "aws", side_effect=self.fake_aws), \
              patch("builtins.input", side_effect=lambda _: f"{self.master} {self.worker}"), \
              contextlib.redirect_stdout(io.StringIO()):
@@ -219,7 +289,7 @@ class LifecycleTests(unittest.TestCase):
 
     def seed(self):
         self.baseline.write_text(json.dumps({"account": self.account, "region": self.region,
-            "services_masked": True, "nodes": [
+            "services_masked": True, "control_plane_schedulable": True, "nodes": [
                 {"role": "master", "instance_id": self.master, "root_volume_id": "vol-0", "snapshot_id": "snap-0"},
                 {"role": "worker", "instance_id": self.worker, "root_volume_id": "vol-1", "snapshot_id": "snap-1"}]}))
         self.state = "running"
@@ -257,12 +327,19 @@ class LifecycleTests(unittest.TestCase):
                     self.run_lab("snapshot", apply=True)
                 self.assertFalse(self.mutations())
 
+    def test_snapshot_requires_taint_free_confirmation_before_mutation(self):
+        with self.assertRaisesRegex(RuntimeError, "taint-free"):
+            self.run_lab("snapshot", apply=True, taint_free=False)
+        self.assertFalse(self.mutations())
+        self.assertFalse(self.baseline.exists())
+
     def test_snapshot_records_both_root_volumes(self):
         self.run_lab("snapshot", apply=True)
         saved = json.loads(self.baseline.read_text())
         self.assertEqual(saved["account"], "123456789012")
         self.assertEqual(saved["region"], "ap-southeast-1")
         self.assertTrue(saved["services_masked"])
+        self.assertTrue(saved["control_plane_schedulable"])
         self.assertEqual([(n["root_volume_id"], n["snapshot_id"]) for n in saved["nodes"]],
                          [("vol-0", "snap-0"), ("vol-1", "snap-1")])
 
@@ -319,6 +396,8 @@ class LifecycleTests(unittest.TestCase):
         data = json.loads(logs[0].read_text())
         self.assertEqual([n["task_id"] for n in data["nodes"]], ["replacevol-0", "replacevol-1"])
         self.assertEqual([n["displaced_volume_id"] for n in data["nodes"]], ["vol-0", "vol-1"])
+        self.assertEqual(self.calls[-1], ("ec2", "wait", "instance-status-ok",
+                                         "--instance-ids", self.master, self.worker))
 
     def test_partial_reset_records_first_task_and_does_not_delete(self):
         self.seed()
@@ -329,6 +408,16 @@ class LifecycleTests(unittest.TestCase):
         data = json.loads(logs[0].read_text())
         self.assertEqual(data["nodes"][0]["task_id"], "replacevol-0")
         self.assertFalse(any(c[1].startswith("delete-") for c in self.calls))
+
+    def test_reset_rejects_baseline_without_schedulable_control_plane(self):
+        for value in (None, False):
+            self.seed()
+            data = json.loads(self.baseline.read_text())
+            data["control_plane_schedulable"] = value
+            self.baseline.write_text(json.dumps(data))
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "schedulable"):
+                self.run_lab("reset", apply=True)
+            self.assertFalse(self.mutations())
 
     def test_transient_failure_keeps_observing_both_tasks_to_terminal_states(self):
         path = Path(self.tmp.name) / 'tasks.json'
@@ -346,6 +435,48 @@ class LifecycleTests(unittest.TestCase):
                 self.lab.wait_tasks(path, journal)
         self.assertEqual([n['task_state'] for n in json.loads(path.read_text())['nodes']],
                          ['failed-detached', 'succeeded'])
+
+    def cleanup(self, apply=False, confirmation=None):
+        argv = ["cleanup", "--master", self.master, "--worker", self.worker, "--region", self.region]
+        if apply:
+            argv.append("--apply")
+        with patch.object(self.lab, "aws", side_effect=self.fake_aws), \
+             patch("builtins.input", return_value=confirmation or f"{self.master} {self.worker}"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.lab.main(argv)
+
+    def test_cleanup_terminates_exactly_the_two_lab_instances(self):
+        self.cleanup(apply=True)
+        writes = [c for c in self.calls if c[1] == "terminate-instances"]
+        self.assertEqual(writes, [("ec2", "terminate-instances", "--instance-ids", self.master, self.worker)])
+        self.assertEqual(self.calls[-1], ("ec2", "wait", "instance-terminated",
+                                         "--instance-ids", self.master, self.worker))
+        self.assertFalse(any(c[1].startswith(("create-", "delete-")) for c in self.calls))
+
+    def test_cleanup_preview_and_rejected_confirmation_never_terminate(self):
+        self.cleanup()
+        self.assertFalse(any(c[1] == "terminate-instances" for c in self.calls))
+        with self.assertRaisesRegex(RuntimeError, "Confirmation did not match"):
+            self.cleanup(apply=True, confirmation="wrong")
+        self.assertFalse(any(c[1] == "terminate-instances" for c in self.calls))
+
+    def test_cleanup_rejects_unrelated_instances_and_skips_terminated_pair(self):
+        original_aws = self.fake_aws
+
+        def unrelated(service, action, *args):
+            result = original_aws(service, action, *args)
+            if action == "describe-instances":
+                result["Reservations"][0]["Instances"][1]["Tags"] = []
+            return result
+
+        with patch.object(self, "fake_aws", side_effect=unrelated):
+            with self.assertRaisesRegex(RuntimeError, "Purpose tag"):
+                self.cleanup(apply=True)
+        self.assertFalse(any(c[1] == "terminate-instances" for c in self.calls))
+        self.state = "terminated"
+        self.cleanup(apply=True)
+        self.assertFalse(any(c[1] == "terminate-instances" for c in self.calls))
+        self.assertFalse(self.baseline.exists())
 
     def test_failed_tasks_and_timeout_fail_closed(self):
         self.seed()

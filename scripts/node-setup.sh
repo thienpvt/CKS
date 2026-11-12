@@ -56,12 +56,26 @@ ubuntu_calico() (
       (( SECONDS < deadline )) || { printf 'Timed out waiting for %s\n' "$crd" >&2; return 1; }
       sleep 2
     done
-    kubectl wait --for=condition=Established "crd/$crd" --timeout=300s
+    # A new CRD may exist before status.conditions; kubectl wait can fail immediately.
+    until kubectl wait --for=condition=Established "crd/$crd" --timeout=5s; do
+      (( SECONDS < deadline )) || { printf 'Timed out waiting for %s\n' "$crd" >&2; return 1; }
+      sleep 2
+    done
   done
   kubectl create -f "$tmp/resources.yaml"
 )
 
 install_calico() { ubuntu_calico; }
+
+untaint_master() {
+  local taints
+  taints=$(kubectl --kubeconfig=/etc/kubernetes/admin.conf get node cks-master \
+    -o jsonpath='{range .spec.taints[*]}{.key}{":"}{.effect}{"\n"}{end}') || return
+  if grep -qx 'node-role.kubernetes.io/control-plane:NoSchedule' <<< "$taints"; then
+    kubectl --kubeconfig=/etc/kubernetes/admin.conf taint node cks-master \
+      node-role.kubernetes.io/control-plane:NoSchedule-
+  fi
+}
 
 bootstrap() {
   local role="${1:-}" setup="${2:-}"
@@ -74,7 +88,8 @@ bootstrap() {
   source "$setup/$role-startup.sh"
   install_containerd() { ubuntu_containerd; }
   install_calico() { ubuntu_calico; }
-  main "$role"
+  ( main "$role" ) # Original main exits early when the node is already initialized.
+  if [[ "$role" == master ]]; then untaint_master; fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
